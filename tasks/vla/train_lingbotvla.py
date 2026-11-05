@@ -46,6 +46,8 @@ from lingbotvla.models.vla.vision_models.module_utils import (
 )
 from lingbotvla.models.vla.lingbot_vla.moe_load_balance import build_moe_load_balance_hook
 import gc
+import shutil
+import threading
 gc.set_threshold(50000, 50, 50)
 
 logger = helper.create_logger(__name__)
@@ -329,8 +331,267 @@ class Arguments:
     eval: "EvalArguments" = field(default_factory=EvalArguments)
 
 
+def _load_forge_events():
+    """Forge 平台训练事件(可选插桩,best-effort)。
+
+    rsystem 的提交端经 FORGE_EVENTS_HOOK=<events.py 绝对路径> 指向独立单文件模块:
+    - 不在环境 = 官方行为零改动;在环境但无 FORGE_EVENT_FILE/RDATABUS 配置 → None
+    - 事件四类: TRAIN_STARTED / TRAIN_METRICS(=TB 信息,每 N 步抽样)/ CKPT_READY /
+      TRAIN_FINISHED;jsonl 兜底 + 可选 R-Databus,由该模块自管,这里只 emit。
+    """
+    try:
+        import importlib.util
+        hook = os.environ.get("FORGE_EVENTS_HOOK", "")
+        if not hook or not os.path.isfile(hook):
+            return None
+        spec = importlib.util.spec_from_file_location("forge_events", hook)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.get_publisher()
+    except Exception:
+        return None
+
+
+def _forge_emit(pub, method, *args, **kwargs):
+    """事件发布绝不弄死训练:所有调用点都过这里包死。"""
+    try:
+        if pub is not None:
+            getattr(pub, method)(*args, **kwargs)
+    except Exception:
+        pass
+
+
+def _forge_prune_old_dcp(save_checkpoint_path, keep=None):
+    """dcp 滚动清理:每个 save 点后删更旧的 dcp 大件(model/optimizer/extra_state),
+    保留最近 keep 套(FORGE_KEEP_DCP env,默认 2)。best-effort,失败不影响训练。"""
+    try:
+        import re as _re
+        import shutil as _shutil
+        if not save_checkpoint_path or not os.path.isdir(save_checkpoint_path):
+            return
+        keep = keep or int(os.environ.get("FORGE_KEEP_DCP", "2"))
+        steps = []
+        for d in os.listdir(save_checkpoint_path):
+            m = _re.fullmatch(r"global_step_(\d+)", d)
+            if m and os.path.isdir(os.path.join(save_checkpoint_path, d, "model")):
+                steps.append((int(m.group(1)), d))
+        steps.sort()
+        for _s, d in (steps[:-keep] if len(steps) > keep else []):
+            base = os.path.join(save_checkpoint_path, d)
+            for part in ("model", "optimizer", "extra_state"):
+                p = os.path.join(base, part)
+                if os.path.isdir(p):
+                    _shutil.rmtree(p, ignore_errors=True)
+                    print(f"[forge-prune] removed old dcp: {p}")
+    except Exception as e:
+        print(f"[forge-prune] failed (ignored): {e!r}")
+
+
+def _forge_export_names() -> list:
+    """Adapt manifest entries: config names generated for this job's datasets.
+
+    Two sources, managed first:
+    - managed chain: FORGE_ADAPT_MANIFEST (launcher's .forge_adapt/manifest.json)
+    - custom/bare runs (2026-11-04 fix): FORGE_EXPORT_NAMES, fed by main() from
+      the datasets.txt prefixes. Without this fallback the flatten loop was a
+      no-op on custom pods and every published hf_ckpt shipped WITHOUT
+      robot_config.yaml/norm_states.json — the exact gap seen on the ec80ce86
+      order (10 checkpoints, self-contained three-piece missing)."""
+    manifest = os.environ.get("FORGE_ADAPT_MANIFEST", "").strip()
+    if not (manifest and os.path.isfile(manifest)):
+        names = [n for n in os.environ.get("FORGE_EXPORT_NAMES", "").split(",") if n]
+        return list(dict.fromkeys(names))
+    try:
+        import json as _json
+        with open(manifest, encoding="utf-8") as f:
+            return list(_json.load(f).get("export_configs") or [])
+    except Exception as e:
+        print(f"[forge-slim] manifest unreadable: {e!r}")
+        return []
+
+
+def _forge_train_config_text(args) -> str:
+    """Train config shipped inside each ckpt (fork-native lingbotvla_cli.yaml).
+
+    Same structure as the legacy save_args dump (asdict minus eval). Fills
+    data.norm_stats_file with norm_states.json whenever any export config is
+    present — multi-dataset orders now merge into ONE unified config+stats
+    pair on the launcher side (2026-11-05, 4b8ba4ba dispatch failure), so the
+    field is never null and always names a real sibling file."""
+    try:
+        args_dict = asdict(args)
+        args_dict.pop("eval", None)
+        if _forge_export_names():
+            args_dict.setdefault("data", {})["norm_stats_file"] = "norm_states.json"
+        import yaml as _yaml
+        return _yaml.safe_dump(args_dict, default_flow_style=False)
+    except Exception as e:
+        print(f"[forge-slim] train config serialization failed: {e!r}")
+        return ""
+
+
+def _forge_publish_hf_ckpt(ckpt_dir, publish_root):
+    """Copy the finished hf_ckpt/ to the mounted checkpoints dir (2026-10-29
+    layering: raw dcp stays pod-local, only the slimmed hf bundle reaches the
+    mount — a kill inside the save window can only burn the local layer, the
+    mount never holds half-written dcp shards). config.json is copied last as
+    the completeness sentinel: an interrupted publish leaves no config.json,
+    so consumers never see a half artifact. Idempotent via the same sentinel.
+    Returns the published hf_ckpt path, or None on failure (local copy kept)."""
+    try:
+        import shutil as _shutil
+        hf_dir = os.path.join(ckpt_dir, "hf_ckpt")
+        step_name = os.path.basename(os.path.normpath(ckpt_dir))
+        dst = os.path.join(publish_root, step_name, "hf_ckpt")
+        if os.path.isfile(os.path.join(dst, "config.json")):
+            return dst
+        os.makedirs(dst, exist_ok=True)
+        for name in sorted(os.listdir(hf_dir)):
+            src = os.path.join(hf_dir, name)
+            if name == "config.json" or not os.path.isfile(src):
+                continue
+            # copyfile NOT copy2 (2026-11-03 custom-training EPERM): copy2's
+            # copystat chmod/utime hit the publish mount (ossfs, no setattr
+            # support) -> PermissionError(1) under the unprivileged custom
+            # training uid. Managed orders run as root and never tripped it;
+            # content copy is all a publish needs.
+            _shutil.copyfile(src, os.path.join(dst, name))
+        _shutil.copyfile(os.path.join(hf_dir, "config.json"), os.path.join(dst, "config.json"))
+        print(f"[forge-slim] published hf_ckpt -> {dst}")
+        return dst
+    except Exception as e:
+        print(f"[forge-slim] publish {ckpt_dir} failed (kept local): {e!r}")
+        return None
+
+
+def _forge_slim_ckpt_dir(ckpt_dir, cli_yaml_text=None, publish_root=None):
+    """Self-contained ckpt for model distribution (backend contract 2026-10-26).
+
+    Inference assets are flattened INTO hf_ckpt/:
+      lingbotvla_cli.yaml   train config (data.norm_stats_file -> norm_states.json)
+      robot_config.yaml     robot config of the export dataset
+      norm_states.json      normalization stats                       \
+      *_<i>.yaml / *_<i>.json  suffix variants when multiple datasets  /
+    The robot config's internal norm_stats pointer is rewritten to the
+    relative sibling file so the ckpt stays valid after it leaves the pod.
+    publish_root given = layering mode: additionally publish hf_ckpt to the
+    mounted checkpoints dir (see _forge_publish_hf_ckpt) and strip dcp parts
+    from the LOCAL layer only. FORGE_CKPT_KEEP_DCP keeps local dcp; a step
+    whose HF conversion did not finish keeps its dcp as the only surviving
+    copy (pod-local). Best-effort, never kills training."""
+    hf_published = None
+    try:
+        import shutil as _shutil
+        import yaml as _yaml
+        if not os.path.isdir(ckpt_dir):
+            return None
+        hf_dir = os.path.join(ckpt_dir, "hf_ckpt")
+        if not os.path.isfile(os.path.join(hf_dir, "config.json")):
+            print(f"[forge-slim] {ckpt_dir} hf_ckpt not ready, keep dcp")
+            return None
+        if cli_yaml_text and not os.path.exists(os.path.join(hf_dir, "lingbotvla_cli.yaml")):
+            with open(os.path.join(hf_dir, "lingbotvla_cli.yaml"), "w", encoding="utf-8") as f:
+                f.write(cli_yaml_text)
+            print(f"[forge-slim] wrote lingbotvla_cli.yaml -> {hf_dir}")
+        names = _forge_export_names()
+        manifest = os.environ.get("FORGE_ADAPT_MANIFEST", "").strip()
+        base = os.path.dirname(manifest) if manifest else os.environ.get(
+            "FORGE_ROBOT_CONFIG_ROOT", "").strip()
+        for i, name in enumerate(names):
+            suffix = "" if len(names) == 1 else f"_{i}"
+            cfg_dst = os.path.join(hf_dir, f"robot_config{suffix}.yaml")
+            stats_dst = os.path.join(hf_dir, f"norm_states{suffix}.json")
+            cfg_src = os.path.join(base, "robot_configs", f"{name}.yaml")
+            if not os.path.isfile(cfg_src):
+                # custom-training layout: configs sit flat in robot_config_root
+                # (agilex_export_0.yaml + norm_states.json style)
+                cfg_src = os.path.join(base, f"{name}.yaml")
+            stats_src = os.path.join(base, "norm_stats", f"{name}.json")
+            if not os.path.isfile(stats_src):
+                flat = [os.path.join(base, f"{name}.json")]
+                if len(names) == 1:
+                    flat.append(os.path.join(base, "norm_states.json"))
+                stats_src = next((p for p in flat if os.path.isfile(p)), stats_src)
+            if os.path.isfile(cfg_src) and not os.path.exists(cfg_dst):
+                cfg = _yaml.safe_load(open(cfg_src, encoding="utf-8")) or {}
+                cfg["norm_stats"] = os.path.basename(stats_dst)   # relative sibling
+                with open(cfg_dst, "w", encoding="utf-8") as f:
+                    _yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+            if os.path.isfile(stats_src) and not os.path.exists(stats_dst):
+                _shutil.copyfile(stats_src, stats_dst)   # see publish note: no setattr on fuse targets
+        if names:
+            print(f"[forge-slim] flattened {len(names)} dataset asset(s) -> {hf_dir}")
+        if publish_root:
+            hf_published = _forge_publish_hf_ckpt(ckpt_dir, publish_root)
+            if hf_published:
+                # The local hf_ckpt is only a publish source: drop it once the
+                # mount holds the copy, or long runs (20+ save points) pile up
+                # ~24G per step inside the pod-local volume budget.
+                _shutil.rmtree(hf_dir, ignore_errors=True)
+                print(f"[forge-slim] local copy dropped after publish: {hf_dir}")
+        if os.environ.get("FORGE_CKPT_KEEP_DCP", "").strip() not in ("", "0"):
+            return hf_published
+        for name in ("model", "optimizer", "extra_state"):
+            p = os.path.join(ckpt_dir, name)
+            if os.path.isdir(p):
+                _shutil.rmtree(p, ignore_errors=True)
+                print(f"[forge-slim] removed dcp part: {p}")
+    except Exception as e:
+        print(f"[forge-slim] {ckpt_dir} failed (ignored): {e!r}")
+    return hf_published
+
+
+def _forge_slim_all_checkpoints(save_checkpoint_path, cli_yaml_text=None, publish_root=None,
+                                 submitted=None):
+    """收尾兜底:hf_saver drain 完之后把【本次训练提交过的】save 点再核一遍(异步线程里
+    slim 半途失败的补刀),保证 FINISHED 事件发出时本轮产物结构已定盘(publish 模式=同步
+    补发挂载侧成品)。
+
+    submitted(hf_saver._submitted_paths)限制只处理本轮真正 checkpoint 过的目录:
+    custom-training 复用同一个 FORGE_SAVE_CKPT_PATH 起多轮训练时,目录里会留着往轮
+    的 global_step_*(kept local 语义的遗产)——那不是本轮的东西,不许替用户搬上挂载
+    (2026-11-03 生产实测:40 步单被 sweep 补发了往轮 60/80/100,并按用户要求收敛)。
+    本轮的重名 step 目录由 DCP 覆盖写,旧轮残留由 slim 剥离时自然覆盖,无混读。"""
+    try:
+        import re as _re
+        if not save_checkpoint_path or not os.path.isdir(save_checkpoint_path):
+            return
+        if submitted is not None:
+            todo = sorted(p for p in submitted if os.path.isdir(p))
+        else:
+            todo = [os.path.join(save_checkpoint_path, d)
+                    for d in sorted(os.listdir(save_checkpoint_path))
+                    if _re.fullmatch(r"global_step_\d+", d)]
+        for ckpt in todo:
+            _forge_slim_ckpt_dir(ckpt, cli_yaml_text, publish_root=publish_root)
+    except Exception as e:
+        print(f"[forge-slim] sweep failed (ignored): {e!r}")
+
+
 def main():
     args = parse_args(Arguments)
+    # Workspace layering (2026-10-29): save_checkpoint_path is DERIVED in
+    # TrainArguments.__post_init__ (output_dir/checkpoints) and is NOT a yaml
+    # field — the strict parser rejects it as a config key. The launcher hands
+    # the pod-local dcp layer over via env; override the derived value here.
+    # All 8 ranks apply the same override (each rank writes its own shard).
+    _forge_save_override = (os.environ.get("FORGE_SAVE_CKPT_PATH") or "").strip()
+    if _forge_save_override:
+        args.train.save_checkpoint_path = _forge_save_override
+        print(f"[forge] save_checkpoint_path override -> {_forge_save_override}")
+    # Flatten-fallback envs (2026-11-04 fix, custom-training gap): on managed
+    # orders the launcher writes FORGE_ADAPT_MANIFEST; custom pods have no such
+    # manifest, and slim's flatten loop then shipped hf_ckpt WITHOUT
+    # robot_config.yaml/norm_states.json (ec80ce86 order: 10 checkpoints all
+    # missing the self-contained pair). Feed the same facts straight from the
+    # parsed config: dataset names from datasets.txt + the robot_config_root.
+    os.environ.setdefault("FORGE_ROBOT_CONFIG_ROOT", str(args.data.robot_config_root or ""))
+    try:
+        with open(args.data.train_path, encoding="utf-8") as _f:
+            _names = [ln.split()[0] for ln in _f if ln.strip() and len(ln.split()) >= 2]
+        os.environ.setdefault("FORGE_EXPORT_NAMES", ",".join(_names))
+    except (OSError, IndexError):
+        pass
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     torch.cuda.set_device(f"cuda:{args.train.local_rank}")
@@ -340,7 +601,14 @@ def main():
         helper.enable_third_party_logging()
 
     if args.train.global_rank == 0:
-        save_args(args, args.train.output_dir)
+        # 2026-10-23 存储收敛:不再向 output_dir 根写 lingbotvla_cli.yaml(ckpt 内
+        # veomni_cli.yaml 才是正式份,根上属于重复)。内容源改在内存生成,由
+        # _forge_slim_ckpt_dir 就地写进每个 save 点。
+        cli_yaml_text = _forge_train_config_text(args)
+        if cli_yaml_text:
+            print("[forge-slim] veomni_cli.yaml 内容源就绪(每 ckpt 落盘一份)")
+        else:
+            cli_yaml_text = None
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
@@ -409,7 +677,10 @@ def main():
             moge_model = torch.compile(moge_model)
             morgbd_model = torch.compile(morgbd_model)
         if 'visual_dir' not in args.train.align_params or not args.train.align_params['visual_dir']:
-            args.train.align_params['visual_dir'] = os.path.join(args.train.output_dir, 'images')
+            # 2026-10-23 存储收敛:蒸馏视觉缓存是即焚中间物,不进 PVC(原先落
+            # output_dir/images 空占目录);FORGE_VISUAL_DIR 可覆盖
+            args.train.align_params['visual_dir'] = os.environ.get(
+                "FORGE_VISUAL_DIR", "/tmp/forge_align_visuals")
         os.makedirs(args.train.align_params['visual_dir'], exist_ok=True)
         if use_future_video:
             print('====Loading Future Video Model====')
@@ -559,7 +830,14 @@ def main():
     )
 
     if args.train.global_rank == 0:
-        log_dir=f"{args.train.output_dir}/runs/"
+        # 2026-11-01 hang root cause: TB on the ossfs output mount stalled a
+        # fuse write -> epoch-end flush() blocked rank0 for the whole 600s
+        # NCCL watchdog (3/3 runs died at step 1731, run 69d9373d probe
+        # verdict). Diagnostics IO must live on the disk-backed local layer —
+        # launcher hands over FORGE_TB_LOG_DIR (=ckpt_local/tb); legacy/local
+        # setups without that env keep the old output_dir/runs behavior.
+        tb_root = os.environ.get("FORGE_TB_LOG_DIR") or args.train.output_dir
+        log_dir = os.path.join(tb_root, "runs")
         writer = AsyncTBWriter(log_dir=log_dir)
         if args.train.use_wandb:
             wandb.init(
@@ -578,23 +856,48 @@ def main():
             )
             profiler.start()
 
+        # 2026-10-23 存储收敛:model_assets(processor/config 序列化,eval 提交用)
+        # 默认不落 PVC——开环 eval 接通后再开(FORGE_SAVE_MODEL_ASSETS=1)。
         model_assets = [model_config, processor]
-        save_model_assets(args.train.model_assets_dir, model_assets)
+        if os.environ.get("FORGE_SAVE_MODEL_ASSETS", "").strip() in ("", "0"):
+            print("[forge-slim] model_assets 不落盘(eval 未接通;FORGE_SAVE_MODEL_ASSETS=1 开启)",
+                  flush=True)
+        else:
+            save_model_assets(args.train.model_assets_dir, model_assets)
 
     start_epoch, start_step, global_step = 0, 0, 0
     current_epoch_for_eval, current_epoch_step_for_eval = 1, 0
+    # Forge 训练事件:rank0 加载;hf_ckpt 真正落盘后由 saver 回调发 CKPT_READY
+    forge_events = _load_forge_events() if args.train.global_rank == 0 else None
+
     save_checkpoint_path = None
     hf_failure_log_path = (
         os.path.join(args.train.save_checkpoint_path, "async_hf_failures.jsonl")
         if args.train.save_checkpoint_path
         else None
     )
+
+    def _forge_ckpt_ready(result):
+        # saver 转换线程里调用(events.py 线程安全);失败/未产出不发 READY。
+        # slim 不依赖事件配置(forge_events None 时也要做,故 on_result 无条件挂)。
+        # 2026-10-29 layering: slim/publish BEFORE the emit, so consumers see
+        # the mount-side path and the artifact is already there when READY lands.
+        if result.hf_success and result.hf_path:
+            pub_root = (os.environ.get("FORGE_PUBLISH_CKPT_ROOT", "") or "").strip()
+            published = _forge_slim_ckpt_dir(result.checkpoint_path, cli_yaml_text,
+                                             publish_root=pub_root or None)
+            ckpt_path = os.path.dirname(published) if published else result.checkpoint_path
+            hf_path = published or result.hf_path
+            _forge_emit(forge_events, "emit_ckpt_ready", result.global_step, hf_path,
+                        checkpointPath=ckpt_path)
+
     hf_saver = AsyncHFCheckpointSaver(
         enabled=args.train.async_save_hf_weights,
         max_pending=args.train.async_hf_max_pending,
         logger=logger,
         failure_log_path=hf_failure_log_path,
         eval_args=args.eval,
+        on_result=_forge_ckpt_ready,
     )
 
     def save_hf_checkpoint_best_effort(
@@ -688,6 +991,40 @@ def main():
     logger.info(
         f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
     )
+    # Contract fields for frontend step/epoch conversion. train_steps equals
+    # steps-per-epoch after compute_train_steps; report effective epoch count
+    # (trainingSteps / steps_per_epoch), not the framework's default cap.
+    _forge_spe = int(args.train.train_steps) or 1
+    _forge_total_epochs = max(
+        1, -(-int(args.train.max_steps or _forge_spe) // _forge_spe))
+    _forge_emit(forge_events, "emit_started",
+                maxSteps=args.train.max_steps or args.train.train_steps,
+                worldSize=args.train.world_size,
+                globalBatch=args.train.global_batch_size,
+                stepsPerEpoch=args.train.train_steps,
+                totalEpochs=_forge_total_epochs,
+                outputDir=args.train.output_dir)
+    # Forge 心跳守护线程(rank0):每 N 秒一条 RUNNING 信号——消息形态=TRAIN_METRICS
+    # 空 metrics,current_step 取当前步。消费端"有消息=进程活着",与步进事件解耦;
+    # 后端消费代码零改动(曲线画空 metrics 自然无点)。间隔 env FORGE_EVENT_HEARTBEAT_SEC
+    # 默认 60,0=关;终态前由 _forge_hb_stop 停止,防止 FINISHED 后再冒 RUNNING。
+    _forge_hb_stop = threading.Event()
+
+    def _forge_heartbeat(_pub, _step_box):
+        try:
+            interval = max(0, int(os.environ.get("FORGE_EVENT_HEARTBEAT_SEC", "60")))
+        except ValueError:
+            interval = 60
+        if _pub is None or interval == 0:
+            return
+        while not _forge_hb_stop.wait(interval):
+            # Liveness only: no metrics fields polluting the loss/throughput series.
+            _forge_emit(_pub, "emit_heartbeat", _step_box[0])
+
+    if forge_events is not None:
+        _forge_step_box = [0]
+        threading.Thread(target=_forge_heartbeat, args=(forge_events, _forge_step_box),
+                         daemon=True, name="forge-heartbeat").start()
     # create the path in advance to save loss log
     if args.train.global_rank == 0:
         os.makedirs(args.train.save_checkpoint_path, exist_ok=True)
@@ -703,7 +1040,61 @@ def main():
             initial=global_step,
             disable=args.train.local_rank != 0,
         )
+    def _forge_epoch_probe(tag: str) -> None:
+        # 2026-10-31 epoch-boundary forensics: two prod orders (84037b10/6dc3cd43)
+        # froze for exactly the 600s NCCL watchdog at the SAME point — the epoch
+        # 3->4 boundary (global 1731 = 3x577), zero NCCL/CUDA/OOM lines. Probe
+        # worker/shm state at every epoch boundary so the next repro answers
+        # whether we stall before set_epoch, between iter() and the probe, or
+        # inside worker respawn.
+        if args.train.global_rank != 0:
+            return
+        try:
+            shm = os.popen("df -h /dev/shm 2>/dev/null | tail -1").read().strip()
+            top = os.popen("ps -eo rss,comm --no-headers | sort -rnk1 | head -3").read()
+            print(f"[epoch-probe] {tag} epoch-loop | shm[{shm}] | top-rss:\n{top}", flush=True)
+        except Exception as e:
+            print(f"[epoch-probe] {tag} failed: {e!r}", flush=True)
+
+    def _forge_rank_probe(tag: str) -> None:
+        # 2026-11-01 run #3 (forge-train-1ebff0e2, FORGE_NUM_WORKERS=4): worker
+        # count did NOT change the freeze — same step 1731, same SeqNum 592022,
+        # head probes for epochs 1/2/3 normal, epoch-4 "before" never printed.
+        # So ALL ranks are stuck between the last collective of step 1731 and
+        # the epoch-4 head: the post-inner-loop epoch tail (tqdm.close / writer
+        # flush / print_device_mem_info) is the blind spot. Every rank prints a
+        # one-line marker through the tail — the straggler rank is the one whose
+        # marker is missing when the freeze hits.
+        try:
+            print(f"[rank-probe] r{args.train.global_rank} gstep={global_step} {tag}", flush=True)
+        except Exception as e:
+            print(f"[rank-probe] {tag} failed: {e!r}", flush=True)
+
+    def _forge_async_tb_flush() -> None:
+        # 2026-11-01 run #4 (69d9373d) VERDICT: rank0 froze exactly inside the
+        # epoch-tail writer.flush() — r1..r7 printed every tail marker incl.
+        # epoch-head of epoch 4, r0 stopped at tqdm-closed. TB runs/ lives on
+        # the ossfs output mount, so a hung sync flush on the fuse path held
+        # all 8 ranks hostage (7 ranks waited in the first forward allgather
+        # of step 1732 -> 600s NCCL watchdog killed the whole job, 3/3 runs).
+        # Diagnostics must never gate training: flush in a daemon thread and
+        # drop it on the floor if the fuse path stalls.
+        if args.train.global_rank != 0:
+            return
+        t = threading.Thread(target=_tb_flush_worker, daemon=True)
+        t.start()
+
+    def _tb_flush_worker() -> None:
+        _forge_rank_probe("tb-flush-start")
+        try:
+            writer.flush()
+            _forge_rank_probe("tb-flush-done")
+        except Exception as e:
+            _forge_rank_probe(f"tb-flush-failed: {e!r}")
+
     for epoch in range(start_epoch, args.train.num_train_epochs):
+        _forge_epoch_probe("before")
+        _forge_rank_probe("epoch-head")
         current_epoch_for_eval = epoch + 1
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
@@ -717,9 +1108,14 @@ def main():
                 disable=args.train.local_rank != 0,
             )
         data_iterator = iter(train_dataloader)
+        _forge_epoch_probe("iter-built")
         for epoch_step in range(start_step, args.train.train_steps):
             current_epoch_step_for_eval = epoch_step + 1
             global_step += 1
+            try:
+                _forge_step_box[0] = global_step   # 心跳线程读当前步(闭包内 box)
+            except NameError:
+                pass
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
@@ -1020,6 +1416,17 @@ def main():
                 writer.add_scalar("training/avg_lang_length", avg_lang_length, global_step)
                 writer.add_scalar("training/max_norm_batch", ignore_batch_num, global_step)
                 writer.add_scalar("steptime", delta_time, global_step)
+                # Forge TRAIN_METRICS(=TB 信息):TB 每步全量,这里按 metrics_every 抽样;
+                # scalars 与上面 writer.add_scalar 同源(训练循环内已是 reduce 后的标量)。
+                if (forge_events is not None and forge_events.metrics_every
+                        and global_step % forge_events.metrics_every == 0):
+                    _forge_emit(forge_events, "emit_metrics", global_step, {
+                        "training/loss": total_loss,
+                        "training/vla_loss": total_vla_loss,
+                        "training/grad_norm": grad_norm,
+                        "training/lr": lr,
+                        "steptime": delta_time,
+                    })
                 # we only log the last mini batch if grad acc is activated
                 if dataset_names is not None and 'batch_mean_losses' in loss_log:
                     batch_mean_losses = loss_log['batch_mean_losses']  # shape (B,)
@@ -1101,7 +1508,7 @@ def main():
                     },
                 }
                 if args.train.global_rank == 0:
-                    writer.flush()
+                    _forge_async_tb_flush()
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
@@ -1112,18 +1519,26 @@ def main():
                     current_epoch_for_eval,
                     current_epoch_step_for_eval,
                 )
+                # Forge:dcp 滚动清理——保最近 FORGE_KEEP_DCP(默认 2)套,删更旧的
+                # model/optimizer/extra_state(hf_ckpt 不动)。长跑防 shm/cpfs 被 dcp
+                # 堆顶穿(2026-10-13 8881717e 单 24000 步跑到 3000 Step 时 OOM 实测);
+                # enableResume 只需最新一套 dcp,保 2 是双保险。
+                if args.train.global_rank == 0:
+                    _forge_prune_old_dcp(args.train.save_checkpoint_path)
 
             if args.train.max_steps is not None and global_step >= args.train.max_steps:
                 logger.info_rank0(f"Reached max_steps={args.train.max_steps}, stopping training.")
                 reached_max_steps = True
                 break
 
+        _forge_rank_probe("inner-loop-exit")
         if not max_steps_driven:
             data_loader_tqdm.close()
-        if args.train.global_rank == 0:
-            writer.flush()
+        _forge_rank_probe("tqdm-closed")
+        _forge_async_tb_flush()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+        _forge_rank_probe("epoch-tail-done")
         if reached_max_steps:
             already_saved = args.train.save_steps and global_step % args.train.save_steps == 0
             if not already_saved:
@@ -1182,6 +1597,20 @@ def main():
         data_loader_tqdm.close()
     if args.train.global_rank == 0:
         writer.close()
+        # TB now lives on the local layer — archive it back onto the output
+        # mount so successful runs keep their curves. Bounded: a stalled fuse
+        # copy must never hang shutdown; the join gives up after the timeout
+        # and the archive is simply lost (diagnostics only).
+        if os.environ.get("FORGE_TB_LOG_DIR"):
+            _t = threading.Thread(
+                target=shutil.copytree,
+                args=(log_dir, os.path.join(args.train.output_dir, "runs")),
+                kwargs={"dirs_exist_ok": True}, daemon=True)
+            _t.start()
+            _t.join(timeout=300)
+            if _t.is_alive():
+                print(f"[forge-tb] runs archive copy still running after 300s, "
+                      "giving up (local copy stays in ckpt_local)", flush=True)
     torch.cuda.synchronize()
     # release memory
     del optimizer, lr_scheduler
@@ -1197,9 +1626,41 @@ def main():
         )
     hf_saver.wait_all_across_ranks()
 
+    # Forge 收尾兜底:saver 回调线程里 slim 失败的补刀,FINISHED 发出前 ckpt 结构定盘。
+    # 传入 saver 登记表:sweep 只核本轮真正 save 过的点(见函数 docstring,防跨轮补发)。
+    if args.train.global_rank == 0:
+        _forge_slim_all_checkpoints(args.train.save_checkpoint_path, cli_yaml_text,
+                                    publish_root=(os.environ.get("FORGE_PUBLISH_CKPT_ROOT", "") or "").strip() or None,
+                                    submitted=set(hf_saver._submitted_paths))
+
+    # Forge TRAIN_FINISHED(成功路径;崩溃路径由 __main__ 的 except 发 FAILED;
+    # SIGKILL 类外部强杀发不出事件,由平台侧 rc 状态兜底)
+    if args.train.global_rank == 0:
+        _forge_hb_stop.set()                      # 终态前停心跳,防 FINISHED 后再冒 RUNNING
+        _forge_emit(forge_events, "emit_finished", "SUCCEEDED",
+                    checkpointDir=str(args.train.output_dir))
+        if forge_events is not None:
+            try:
+                forge_events.close()
+            except Exception:
+                pass
+
     dist.barrier()
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as _exc:
+        # Forge TRAIN_FINISHED(FAILED):异常退出也要让外界知道。
+        # 只让 torchrun 的 rank0 发,否则 8 个 rank 各发一条。
+        if os.environ.get("RANK", "0") == "0":
+            _pub = _load_forge_events()
+            try:
+                if _pub is not None:
+                    _pub.emit_finished("FAILED", error=repr(_exc))
+                    _pub.close()
+            except Exception:
+                pass
+        raise
