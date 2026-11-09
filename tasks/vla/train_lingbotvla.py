@@ -1297,6 +1297,8 @@ def main():
             else:
                 lr = max(all_lrs)
                 expert_lr = None
+            # global step only: the second counter used to be per-epoch steps
+            # (dataloader size), which read as a confusing second denominator
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
             data_loader_tqdm.update()
             expert_lr_str = f"Expert_LR {expert_lr:.2e}, " if expert_lr is not None else ""
@@ -1305,7 +1307,7 @@ def main():
             sigmoid_val = loss_log.get("moe_summary/topk_sigmoid_avg_rank0", loss_log.get("token_moe/avg_topk_sigmoid", None))
             sigmoid_str = f"AvgSigmoid {sigmoid_val.item() if torch.is_tensor(sigmoid_val) else sigmoid_val:.4f}, " if sigmoid_val is not None else ""
             logger.info_rank0(
-                f"Step {global_step}/{args.train.train_steps}, "
+                f"Step {global_step}, "
                 f"Epoch {epoch+1}, "
                 f"Loss {total_loss:.4f}, "
                 f"VLA_Loss {total_vla_loss:.4f}, "
