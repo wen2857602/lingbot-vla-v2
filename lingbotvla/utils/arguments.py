@@ -271,13 +271,13 @@ class TrainingArguments:
         default=0,
         metadata={"help": "L2 regularization strength."},
     )
-    optimizer: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    optimizer: Literal["adamw", "anyprecision_adamw", "muon", "dist_muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer. Default to adamw."},
     )
     muon_momentum: float = field(
         default=0.95,
-        metadata={"help": "Muon momentum coefficient (only used when optimizer='muon')."},
+        metadata={"help": "Momentum coefficient for muon and dist_muon."},
     )
     muon_nesterov: bool = field(
         default=True,
@@ -299,6 +299,14 @@ class TrainingArguments:
                 "they would otherwise be eligible for Muon (case-insensitive)."
             )
         },
+    )
+    dist_muon_attn_per_head: bool = field(
+        default=True,
+        metadata={"help": "DistMuon: orthogonalize q/k/v projection weights independently per attention head."},
+    )
+    dist_muon_layers_per_bucket: int = field(
+        default=2,
+        metadata={"help": "DistMuon: number of adjacent transformer layers per redistribution/compute bucket."},
     )
     max_grad_norm: float = field(
         default=1.0,
@@ -546,6 +554,13 @@ class TrainingArguments:
 
     def __post_init__(self):
         self._train_steps = -1
+        if self.optimizer == "dist_muon":
+            if self.data_parallel_mode != "fsdp2":
+                raise ValueError("optimizer='dist_muon' requires data_parallel_mode='fsdp2'.")
+            if self.dist_muon_layers_per_bucket <= 0:
+                raise ValueError("dist_muon_layers_per_bucket must be positive.")
+            if getattr(self, "use_moe_expert_lr", False):
+                raise ValueError("optimizer='dist_muon' requires use_moe_expert_lr=false.")
         self.local_rank = int(os.getenv("LOCAL_RANK"))
         self.global_rank = int(os.getenv("RANK"))
         self.world_size = int(os.getenv("WORLD_SIZE"))

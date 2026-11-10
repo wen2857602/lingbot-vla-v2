@@ -17,4 +17,11 @@ from .lr_scheduler import build_lr_scheduler
 from .optimizer import build_muon_optimizer, build_optimizer
 
 
-__all__ = ["build_lr_scheduler", "build_muon_optimizer", "build_optimizer"]
+def build_flex_shard_dist_muon_optimizer(*args, **kwargs):
+    """Load the FlexShard integration only when DistMuon is selected."""
+    from .dist_muon import build_flex_shard_dist_muon_optimizer as _build
+
+    return _build(*args, **kwargs)
+
+
+__all__ = ["build_lr_scheduler", "build_muon_optimizer", "build_optimizer", "build_flex_shard_dist_muon_optimizer"]

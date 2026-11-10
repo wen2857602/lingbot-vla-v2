@@ -31,6 +31,7 @@ from lingbotvla.distributed.parallel_state import get_parallel_state, init_paral
 from lingbotvla.distributed.torch_parallelize import build_parallelize_model
 from lingbotvla.models import build_foundation_model, build_processor, save_model_assets, build_tokenizer
 from lingbotvla.optim import build_lr_scheduler, build_muon_optimizer, build_optimizer
+from lingbotvla.optim import build_flex_shard_dist_muon_optimizer
 from lingbotvla.utils import helper
 from lingbotvla.utils.async_hf_checkpoint import AsyncHFCheckpointSaver
 from lingbotvla.utils.arguments import EvalArguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
@@ -802,6 +803,13 @@ def main():
         adamw_summary = {f"lr={g['lr']:.2e}": len(g["params"]) for g in adamw_groups}
         logger.info_rank0(
             f"Muon enabled. Muon groups: {muon_summary}; AdamW (1D/embed) groups: {adamw_summary}"
+        )
+    elif args.train.optimizer == "dist_muon":
+        optimizer = build_flex_shard_dist_muon_optimizer(
+            model,
+            args.train,
+            lr=args.train.lr,
+            weight_decay=args.train.weight_decay,
         )
     else:
         optimizer = build_optimizer(

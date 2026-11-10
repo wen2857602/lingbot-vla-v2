@@ -24,6 +24,7 @@ Compared with LingBot-VLA 1.0, LingBot-VLA 2.0 improves three core capabilities:
 
 ## News
 
+- **[2026-09-22]** Added **Distributed Muon** to improve training efficiency. It improves single-node H20 post-training speed by **37.6%** over Muon.
 - **[2026-07-25]** RoboTwin post-training weights: [lingbot-vla-v2-6b-robotwin](https://huggingface.co/robbyant/lingbot-vla-v2-6b-robotwin).
 - **[2026-07-08]** LingBot-VLA 2.0 technical report and pre-trained weights are prepared.
 
@@ -154,6 +155,17 @@ bash train.sh tasks/vla/train_lingbotvla.py ./configs/vla/robotwin/robotwin.yaml
 The post-training config uses sequence-wise auxiliary loss (`sequence_wise_mode: "per_sequence"`, `sequence_wise_loss_coeff: 1e-3`) together with z-loss (`router_z_loss_coeff: 1e-4`) for MoE routing. These terms can be adjusted or disabled depending on the downstream task. To use a loss-free routing setup, comment out the sequence-wise auxiliary loss and z-loss options, and set `bias_update_speed: 0.00025`.
 The post-training config also enables the Muon optimizer. Muon can produce a better-converged loss, but it increases training time. To use the default AdamW optimizer instead, comment out `optimizer: muon`.
 
+We also support **Distributed Muon**, adapted from [TorchTitan's FlexShard implementation](https://github.com/pytorch/torchtitan/tree/496b11d43860bb8d27b54568c76db6310ae7f55e/torchtitan/distributed/flex_shard), to improve training efficiency. See [robotwin_dist_muon.yaml](configs/vla/robotwin/robotwin_dist_muon.yaml) for an example and optimizer parameter settings. This implementation requires FSDP2 with at least two data-parallel ranks.
+
+Comparison of RoboTwin 2.0 success rates after post-training on clean and randomized data, and single-node post-training speed on NVIDIA H20 GPUs:
+
+| Optimizer | Clean | Randomized | iteration time (s/it) |
+| :--- | :---: | :---: | :---: |
+| Muon | 93.52 | 92.80 | 5.93 |
+| Distributed Muon | 91.56 | 91.34 | 4.31 |
+
+The parameter settings in [robotwin_dist_muon.yaml](configs/vla/robotwin/robotwin_dist_muon.yaml) are provided as an example for a fair comparison with the Muon optimizer. You can adjust the optimizer settings and other parameters to suit your setup and pursue better performance.
+
 For real-world scenarios, see the native-depth training configuration [real_robot.yaml](configs/vla/real_robot/real_robot.yaml). For detailed explanations of batch size, gradient accumulation, checkpointing, depth/video distillation, MoE, and optimizer settings, see [Training_Config.md](configs/vla/Training_Config.md).
 
 ## Evaluation and Deployment
@@ -259,4 +271,4 @@ This project is licensed under the [Apache-2.0 License](LICENSE).
 
 ## Acknowledgement
 
-We sincerely thank the developers of [VeOmni](https://arxiv.org/abs/2508.02317) and [LeRobot](https://github.com/huggingface/lerobot). This project benefits from their contributions to the open-source community.
+We sincerely thank the developers of [VeOmni](https://arxiv.org/abs/2508.02317) and [LeRobot](https://github.com/huggingface/lerobot). This project benefits from their contributions to the open-source community. We also thank the [TorchTitan](https://github.com/pytorch/torchtitan) team for their Distributed Muon implementations, which our Distributed Muon integration is based on.
