@@ -117,7 +117,10 @@ train:
   optimizer: muon
   num_train_epochs: 29000
   micro_batch_size: 8
-  global_batch_size: 64
+  # batch 默认 256(= 8 micro x 8 gpu x 4 accum);改小时保持恒等式
+  # global = micro * gpu数 * accum,框架会硬校验
+  gradient_accumulation_steps: 4
+  global_batch_size: 256
   max_steps: 10000
   ckpt_manager: dcp
   save_steps: 1000

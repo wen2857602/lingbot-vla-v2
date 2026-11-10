@@ -430,21 +430,37 @@ def _forge_train_config_text(args) -> str:
         return ""
 
 
+# Steps already published by THIS process (dedup for the in-run slim/sweep
+# double pass). Cross-run re-publish must NOT skip: custom pods reuse /data
+# across rounds and same-named global_step_<N> dirs carry NEW weights — a
+# surviving old publish would leave OSS stale while /data is fresh (seen
+# live 2026-11-10: OSS mtime stuck at the previous round).
+_forge_published_steps = set()
+
+
 def _forge_publish_hf_ckpt(ckpt_dir, publish_root):
     """Copy the finished hf_ckpt/ to the mounted checkpoints dir (2026-10-29
     layering: raw dcp stays pod-local, only the slimmed hf bundle reaches the
     mount — a kill inside the save window can only burn the local layer, the
     mount never holds half-written dcp shards). config.json is copied last as
     the completeness sentinel: an interrupted publish leaves no config.json,
-    so consumers never see a half artifact. Idempotent via the same sentinel.
+    so consumers never see a half artifact. Overwrite semantics (2026-11-10):
+    a pre-existing dst is wiped before the copy, so a re-run of the same step
+    name replaces stale weights instead of skipping on the old sentinel; the
+    idempotency within one process is tracked in _forge_published_steps.
     Returns the published hf_ckpt path, or None on failure (local copy kept)."""
     try:
         import shutil as _shutil
         hf_dir = os.path.join(ckpt_dir, "hf_ckpt")
         step_name = os.path.basename(os.path.normpath(ckpt_dir))
         dst = os.path.join(publish_root, step_name, "hf_ckpt")
-        if os.path.isfile(os.path.join(dst, "config.json")):
+        if dst in _forge_published_steps:
             return dst
+        # wipe any previous round's artifact first: during the re-publish
+        # window config.json is absent, so consumers still never see a
+        # half-complete bundle (they see "not ready" instead)
+        _shutil.rmtree(dst, ignore_errors=True)
+        _forge_published_steps.add(dst)
         os.makedirs(dst, exist_ok=True)
         for name in sorted(os.listdir(hf_dir)):
             src = os.path.join(hf_dir, name)
