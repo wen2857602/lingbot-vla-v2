@@ -7,8 +7,9 @@
 #   /data/train/robot_configs/          <- gen_norm_and_robot_config.py output
 #   /data/train/datasets.txt            <- gen_norm_and_robot_config.py output
 # Typically you only touch max_steps / save_steps / batch / lr.
-# NOTE: lr_min must stay below lr (inverted pair flips the cosine into a
-# rising schedule).
+# Post-training recipe aligned to upstream real_robot.yaml: lr 5e-5
+# constant (no decay), norm meanstd, loss fm. lr_min guard stays: must be < lr
+# if you ever switch the decay style back to cosine.
 # ------------------------------------------------------------------
 model:
   model_path: /data/train/model
@@ -34,9 +35,9 @@ data:
   - camera_wrist_left
   - camera_wrist_right
   norm_type:
-  - arm.position: bounds_99_woclip
-  - end.position: bounds_99_woclip
-  - effector.position: bounds_99_woclip
+  - arm.position: meanstd
+  - end.position: meanstd
+  - effector.position: meanstd
   num_workers: 8
   use_future_image: true
 train:
@@ -97,7 +98,7 @@ train:
   routed_scaling_factor: 4.0
   use_shared_expert_gate: false
   use_moe_expert_lr: true
-  loss_type: L1_fm
+  loss_type: fm
   data_parallel_mode: fsdp2
   enable_full_shard: false
   module_fsdp_enable: true
@@ -111,9 +112,9 @@ train:
   action_dim: 55
   max_action_dim: 55
   max_state_dim: 55
-  lr: 1.0e-04
-  lr_min: 5.0e-05
-  lr_decay_style: cosine
+  lr: 5.0e-05
+  lr_min: 1.0e-7
+  lr_decay_style: constant
   optimizer: muon
   num_train_epochs: 29000
   micro_batch_size: 8
@@ -187,7 +188,7 @@ train:
       log_max_samples: 32
       log_scale: 16
     visual_steps: 5000
-  lr_warmup_ratio: 0.03
+  lr_warmup_ratio: 0
   max_grad_norm: 1.0
   async_save_hf_weights: true
 
